@@ -20,13 +20,19 @@ from mnemosyne.core.hygiene import NoiseCandidate, clean_noise
 
 @pytest.fixture
 def temp_db(tmp_path: Path):
+    """Beam-backed temp DB with a gists table for cascade coverage."""
     db_path = tmp_path / "cascade_test.db"
     beam = BeamMemory(session_id="cascade-test", db_path=db_path)
+    beam.conn.execute(
+        "CREATE TABLE IF NOT EXISTS gists (id TEXT PRIMARY KEY, text TEXT, memory_id TEXT)"
+    )
+    beam.conn.commit()
     yield db_path, beam
     beam.conn.close()
 
 
 def _insert_row(beam, table, memory_id, content="noise content"):
+    """Insert one base row; return its rowid for vec seeding."""
     beam.conn.execute(
         f"INSERT INTO {table} (id, content, source, timestamp, session_id, importance, metadata_json) "
         f"VALUES (?, ?, 'test', '2025-01-01T00:00:00', 'cascade-test', 0.5, '{{}}')",
@@ -39,6 +45,7 @@ def _insert_row(beam, table, memory_id, content="noise content"):
 
 
 def _seed_side_rows(beam, memory_id, rowid=None, vec_table=None):
+    """Attach annotation/embedding/gist rows (plus a vec row when asked)."""
     beam.conn.execute(
         "INSERT INTO annotations (memory_id, kind, value) VALUES (?, 'mentions', 'x')",
         (memory_id,),
@@ -46,6 +53,10 @@ def _seed_side_rows(beam, memory_id, rowid=None, vec_table=None):
     beam.conn.execute(
         "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, '[]')",
         (memory_id,),
+    )
+    beam.conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, 'gist text', ?)",
+        (f"gist-{memory_id}", memory_id),
     )
     if rowid is not None and vec_table is not None:
         if vec_table == "vec_episodes":
@@ -57,6 +68,7 @@ def _seed_side_rows(beam, memory_id, rowid=None, vec_table=None):
 
 
 def _candidate(memory_id, table):
+    """Build a delete-suggested candidate for a seeded row."""
     return NoiseCandidate(
         memory_id=memory_id, table_name=table,
         content_preview="noise", noise_score=0.9,
@@ -65,6 +77,7 @@ def _candidate(memory_id, table):
 
 
 def _counts(beam, memory_id):
+    """Count the base row and its side rows (-1 for missing vec tables)."""
     conn = beam.conn
     base_ep = conn.execute(
         "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", (memory_id,)).fetchone()[0]
@@ -85,7 +98,15 @@ def _counts(beam, memory_id):
     return base_ep, base_wm, ann, emb, vec_ep, vec_wm
 
 
+def _gist_count(beam, memory_id):
+    """Count gists rows for a memory."""
+    return beam.conn.execute(
+        "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (memory_id,)
+    ).fetchone()[0]
+
+
 def test_episodic_delete_cascades_side_rows(temp_db):
+    """Episodic delete removes base, annotations, embeddings, gists, vec."""
     db_path, beam = temp_db
     vec_ok = _vec_available(beam.conn)
     if not vec_ok:
@@ -100,6 +121,7 @@ def test_episodic_delete_cascades_side_rows(temp_db):
     assert result.errors == []
     base_ep, _, ann, emb, vec_ep, _ = _counts(beam, "em-1")
     assert (base_ep, ann, emb, vec_ep) == (0, 0, 0, 0)
+    assert _gist_count(beam, "em-1") == 0
 
 
 def test_episodic_delete_cascades_without_vec(temp_db):
@@ -118,6 +140,7 @@ def test_episodic_delete_cascades_without_vec(temp_db):
 
 
 def test_working_delete_cascades_vec_working(temp_db):
+    """Working delete removes base, annotations, embeddings, gists, vec."""
     db_path, beam = temp_db
     vec_ok = _vec_available(beam.conn)
     if not vec_ok:
@@ -132,6 +155,7 @@ def test_working_delete_cascades_vec_working(temp_db):
     assert result.errors == []
     _, base_wm, ann, emb, _, vec_wm = _counts(beam, "wm-1")
     assert (base_wm, ann, emb, vec_wm) == (0, 0, 0, 0)
+    assert _gist_count(beam, "wm-1") == 0
 
 
 def test_legacy_memories_delete_has_no_vec_mirror(temp_db):
@@ -168,4 +192,26 @@ def test_missing_vec_table_does_not_abort_delete(temp_db):
 
     assert result.deleted == 1
     assert result.errors == []
-    assert _counts(beam, "em-3")[0] == 0
+    base_ep, _, ann, emb, _, _ = _counts(beam, "em-3")
+    assert (base_ep, ann, emb) == (0, 0, 0)
+    assert _gist_count(beam, "em-3") == 0
+
+
+def test_required_cascade_failure_rolls_back_base_delete(temp_db):
+    """A failing side-row delete rolls back the base row and records an error."""
+    db_path, beam = temp_db
+    _insert_row(beam, "episodic_memory", "em-4")
+    _seed_side_rows(beam, "em-4")
+    beam.conn.execute(
+        "CREATE TRIGGER fail_ann_delete BEFORE DELETE ON annotations "
+        "BEGIN SELECT RAISE(ABORT, 'forced annotations failure'); END"
+    )
+    beam.conn.commit()
+
+    result = clean_noise(db_path, [_candidate("em-4", "episodic_memory")],
+                         action="delete", confirm=True, dry_run=False)
+
+    assert result.deleted == 0
+    assert len(result.errors) == 1
+    base_ep, _, ann, emb, _, _ = _counts(beam, "em-4")
+    assert (base_ep, ann, emb) == (1, 1, 1)

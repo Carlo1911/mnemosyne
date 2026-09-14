@@ -6525,6 +6525,55 @@ class BeamMemory:
                 self._invalidate_query_cache()
         return forgotten
 
+    def forget_episodic(self, memory_id: str) -> bool:
+        """Delete a session-authorized episodic memory row and its cascade
+        (vector, annotations, embeddings, gists) atomically.
+
+        Same trust boundary as forget_working (see E6.a there): the
+        session-scoped episodic_memory DELETE
+        (``session_id = ? OR scope = 'global'``) authorizes the cascade.
+        A foreign session's private row matches zero rows and is left
+        untouched; a global row may be removed cross-session.
+
+        FTS needs no handling: the em_ad trigger maintains fts_episodes
+        on base-table DELETE.
+
+        Wrapped in _guarded_transaction like forget_working so a
+        mid-cascade failure rolls everything back instead of leaving a
+        half-deleted row.
+        """
+        cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
+        with _guarded_transaction(self.conn):
+            authorized_row = cursor.execute(
+                "SELECT rowid FROM episodic_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            ).fetchone()
+            if authorized_row is not None and _vec_table_available(self.conn, "vec_episodes"):
+                cursor.execute("DELETE FROM vec_episodes WHERE rowid = ?", (int(authorized_row["rowid"]),))
+            cursor.execute(
+                "DELETE FROM episodic_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            )
+            ep_rows = cursor.rowcount
+            if ep_rows > 0:
+                cursor.execute(
+                    "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
+                )
+                cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                gists_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+        forgotten = ep_rows > 0
+        if forgotten:
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_episodic")
+            else:
+                self._invalidate_query_cache()
+        return forgotten
+
     # ------------------------------------------------------------------
     # Episodic Memory
     # ------------------------------------------------------------------

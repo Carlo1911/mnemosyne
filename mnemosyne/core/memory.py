@@ -821,15 +821,15 @@ class Mnemosyne:
                     # up — otherwise episodic rows are unmanageable by ID
                     # (see #959).
                     result = self.beam.forget_episodic(memory_id)
-                    if result:
-                        self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
-                    return result
-                cursor.execute(
-                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
-                    (memory_id, self.session_id),
-                )
-                self.conn.commit()
-                result = False
+                    emit_invalidated = result
+                else:
+                    cursor.execute(
+                        "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                        (memory_id, self.session_id),
+                    )
+                    self.conn.commit()
+                    result = False
+                    emit_invalidated = True
             else:
                 cursor.execute(
                     "DELETE FROM memories WHERE id = ? AND session_id = ?",
@@ -837,7 +837,12 @@ class Mnemosyne:
                 )
                 self.conn.commit()
                 result = self.beam.forget_working(memory_id)
-        self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
+                emit_invalidated = True
+        # Emit only after _deferred_commits finalizes: emitting inside the
+        # block would fire MEMORY_INVALIDATED before _real_commit(), a
+        # phantom event if finalization raises and rolls back.
+        if emit_invalidated:
+            self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
         return result
 
     def update(self, memory_id: str, content: str = None,

@@ -169,10 +169,13 @@ def test_forget_episodic_emits_event_only_on_success(tmp_path: Path, monkeypatch
 
 
 def test_forget_episodic_cascade_failure_rolls_back(tmp_path: Path):
-    """A mid-cascade failure aborts the whole delete; the row survives."""
+    """A mid-cascade failure aborts the whole delete; every row survives."""
     beam = BeamMemory(session_id="sess-a", db_path=tmp_path / "forget_ep.db")
-    _seed_episodic(beam.conn, "em-rb", "sess-a")
-    _seed_cascade(beam.conn, "em-rb")
+    rowid = _seed_episodic(beam.conn, "em-rb", "sess-a")
+    vec_seeded = _vec_available(beam.conn)
+    _seed_cascade(beam.conn, "em-rb", rowid if vec_seeded else None)
+    before = _counts(beam.conn, "em-rb")
+    gist_before = _gist_count(beam.conn, "em-rb")
     beam.conn.execute(
         "CREATE TRIGGER fail_ann_delete BEFORE DELETE ON annotations "
         "BEGIN SELECT RAISE(ABORT, 'forced annotations failure'); END"
@@ -182,4 +185,8 @@ def test_forget_episodic_cascade_failure_rolls_back(tmp_path: Path):
     with pytest.raises(Exception, match="forced annotations failure"):
         beam.forget_episodic("em-rb")
 
-    assert _counts(beam.conn, "em-rb")[0] == 1
+    assert _counts(beam.conn, "em-rb") == before
+    assert _gist_count(beam.conn, "em-rb") == gist_before
+    assert before[0] == 1
+    if vec_seeded:
+        assert before[3] == 1

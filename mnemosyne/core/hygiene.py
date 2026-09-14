@@ -96,14 +96,13 @@ _HYGIENE_VEC_MIRRORS = {
 def _hygiene_ensure_vec(conn: sqlite3.Connection) -> bool:
     """Best-effort sqlite-vec load on a standalone hygiene connection.
 
-    Never raises: without the extension the vec cascade is skipped and
-    the base/annotation/embedding deletes still apply.
+    Never raises: any import or load failure (including non-ImportError
+    ones from a broken native module) disables the vec cascade, and the
+    base/annotation/embedding deletes still apply.
     """
     try:
         import sqlite_vec
-    except ImportError:
-        return False
-    try:
+
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         return True
@@ -123,21 +122,33 @@ def _hygiene_delete_cascade(
 
     Removes the base row, its annotations/memory_embeddings/gists rows
     (keyed by memory_id), and its sqlite-vec entry (keyed by rowid).
-    The vec delete is best-effort: a vec failure is logged and never
-    aborts the base delete.
+
+    The required deletes run inside a per-candidate savepoint: a failure
+    rolls them back and re-raises (the caller records the error), so a
+    half-applied cascade can never persist. The vec delete stays outside
+    the savepoint as best-effort — it is logged and never aborts the
+    base delete.
     """
     row = cursor.execute(
         f"SELECT rowid FROM {table_name} WHERE id = ?", (memory_id,)
     ).fetchone()
     rowid = row["rowid"] if row is not None else None
-    cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (memory_id,))
-    cursor.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
-    cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-    gists_table = cursor.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
-    ).fetchone()
-    if gists_table is not None:
-        cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+    cursor.execute("SAVEPOINT hygiene_delete")
+    try:
+        cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (memory_id,))
+        cursor.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+        cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+        gists_table = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+        ).fetchone()
+        if gists_table is not None:
+            cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+    except Exception:
+        cursor.execute("ROLLBACK TO SAVEPOINT hygiene_delete")
+        cursor.execute("RELEASE hygiene_delete")
+        raise
+    else:
+        cursor.execute("RELEASE hygiene_delete")
     vec_table = _HYGIENE_VEC_MIRRORS.get(table_name)
     if rowid is None or vec_table is None or not vec_loaded:
         return

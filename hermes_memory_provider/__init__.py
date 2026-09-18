@@ -3717,6 +3717,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
         ok = self._beam.forget_working(memory_id)
+        if not ok:
+            # Episodic fallback (see #959): forget_working only searches
+            # working_memory, so an episodic ID would otherwise report
+            # not_found through mnemosyne_forget. forget_episodic carries
+            # the same session-or-global trust boundary as forget_working.
+            ok = self._beam.forget_episodic(memory_id)
         if ok:
             self._audit_event(
                 "forget", memory_id=memory_id, bank="private",

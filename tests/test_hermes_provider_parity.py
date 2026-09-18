@@ -1922,3 +1922,67 @@ def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
         "operations_count": 1,
         "result_statuses": ["stored"],
     }
+
+
+def test_forget_episodic_id_parity_across_providers(tmp_path, provider_modules):
+    """mnemosyne_forget deletes an episodic ID through both providers (#959).
+
+    Both Hermes providers used to route mnemosyne_forget straight to
+    forget_working(), so an episodic ID reported not_found on the
+    productive path even though Mnemosyne.forget() had learned the
+    episodic fallback. A foreign session's private row must still be
+    refused under the same session-or-global trust boundary.
+    """
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"forget-ep-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+        beam = provider._beam
+        conn = beam.conn
+        # NOTE: with profile_isolation=False both providers share the default
+        # bank, so IDs are namespaced per provider (the foreign row
+        # intentionally survives its iteration) and both IDs are removed
+        # in a finally so reruns never collide on UNIQUE(id).
+        own_id, foreign_id = f"ep-own-{name}", f"ep-foreign-{name}"
+        try:
+            conn.execute(
+                "INSERT INTO episodic_memory "
+                "(id, content, source, timestamp, session_id, importance, scope) "
+                "VALUES (?, 'x', 'test', datetime('now'), ?, 0.5, 'session')",
+                (own_id, beam.session_id),
+            )
+            conn.execute(
+                "INSERT INTO episodic_memory "
+                "(id, content, source, timestamp, session_id, importance, scope) "
+                "VALUES (?, 'x', 'test', datetime('now'), 'someone-else', 0.5, 'session')",
+                (foreign_id,),
+            )
+            conn.commit()
+
+            own = json.loads(
+                provider.handle_tool_call("mnemosyne_forget", {"memory_id": own_id})
+            )
+            assert own == {"status": "deleted", "memory_id": own_id}, name
+            assert conn.execute(
+                "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", (own_id,)
+            ).fetchone()[0] == 0
+
+            foreign = json.loads(
+                provider.handle_tool_call("mnemosyne_forget", {"memory_id": foreign_id})
+            )
+            assert foreign == {"status": "not_found", "memory_id": foreign_id}, name
+            assert conn.execute(
+                "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", (foreign_id,)
+            ).fetchone()[0] == 1
+        finally:
+            conn.execute(
+                "DELETE FROM episodic_memory WHERE id IN (?, ?)",
+                (own_id, foreign_id),
+            )
+            conn.commit()
+            conn.close()

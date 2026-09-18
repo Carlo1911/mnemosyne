@@ -184,7 +184,7 @@ def test_missing_vec_table_does_not_abort_delete(temp_db):
     db_path, beam = temp_db
     _insert_row(beam, "episodic_memory", "em-3")
     _seed_side_rows(beam, "em-3")
-    beam.conn.execute("DROP TABLE vec_episodes")
+    beam.conn.execute("DROP TABLE IF EXISTS vec_episodes")
     beam.conn.commit()
 
     result = clean_noise(db_path, [_candidate("em-3", "episodic_memory")],

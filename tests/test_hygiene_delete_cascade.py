@@ -177,6 +177,9 @@ def test_legacy_memories_delete_has_no_vec_mirror(temp_db):
         "SELECT COUNT(*) FROM memories WHERE id = 'leg-1'").fetchone()[0] == 0
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM annotations WHERE memory_id = 'leg-1'").fetchone()[0] == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = 'leg-1'").fetchone()[0] == 0
+    assert _gist_count(beam, "leg-1") == 0
 
 
 def test_missing_vec_table_does_not_abort_delete(temp_db):
@@ -254,3 +257,4 @@ def test_required_cascade_failure_rolls_back_base_delete(temp_db):
     assert len(result.errors) == 1
     base_ep, _, ann, emb, _, _ = _counts(beam, "em-4")
     assert (base_ep, ann, emb) == (1, 1, 1)
+    assert _gist_count(beam, "em-4") == 1

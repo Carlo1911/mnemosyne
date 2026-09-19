@@ -3722,7 +3722,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # working_memory, so an episodic ID would otherwise report
             # not_found through mnemosyne_forget. forget_episodic carries
             # the same session-or-global trust boundary as forget_working.
-            ok = self._beam.forget_episodic(memory_id)
+            # Guarded for mnemosyne-memory releases predating the method
+            # (integrations/hermes permits >=3.11.1): without it the
+            # fallback is skipped exactly as before this change.
+            forget_episodic = getattr(self._beam, "forget_episodic", None)
+            if forget_episodic is not None:
+                ok = forget_episodic(memory_id)
         if ok:
             self._audit_event(
                 "forget", memory_id=memory_id, bank="private",

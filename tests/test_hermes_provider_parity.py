@@ -1986,3 +1986,34 @@ def test_forget_episodic_id_parity_across_providers(tmp_path, provider_modules):
             )
             conn.commit()
             conn.close()
+
+
+class _BeamWithoutEpisodic:
+    """Beam predating forget_episodic (mnemosyne-memory < this change)."""
+
+    def forget_working(self, memory_id):
+        return False
+
+
+def test_forget_without_episodic_method_stays_not_found(
+    tmp_path, provider_modules
+):
+    """An old beam without forget_episodic keeps the old behavior (#961).
+
+    integrations/hermes permits mnemosyne-memory>=3.11.1, which predates
+    the episodic fallback: the guarded call must skip it (not_found)
+    instead of raising AttributeError.
+    """
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"forget-compat-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        provider._beam = _BeamWithoutEpisodic()
+        payload = json.loads(
+            provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"})
+        )
+        assert payload == {"status": "not_found", "memory_id": "x"}, name

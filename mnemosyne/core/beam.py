@@ -6594,6 +6594,18 @@ class BeamMemory:
         A foreign session's private row matches zero rows and is left
         untouched; a global row may be removed cross-session.
 
+        Cascade ownership note: the child tables addressed by ``memory_id``
+        (annotations, memory_embeddings, gists) hold rows for all tiers and
+        carry no tier column, so a colliding ID in another tier would share
+        those rows. IDs are content-derived 16-hex unique values
+        (see ``_generate_id``), so same-tier collisions are already
+        infeasible, and the same unconditional ``WHERE memory_id = ?``
+        cascade is the established behavior of ``forget_working`` — a
+        working delete would equally touch rows seeded for a colliding
+        episodic ID. Scoping the cascade per tier would change behavior
+        for both paths and every existing caller; it is deliberately out
+        of scope here, matching ``forget_working`` exactly.
+
         FTS needs no handling: the em_ad trigger maintains fts_episodes
         on base-table DELETE.
 
@@ -6630,6 +6642,14 @@ class BeamMemory:
             if owns_transaction:
                 self._invalidate_query_cache_after_commit("forget_episodic")
             else:
+                # Same deferred-invalidation contract as forget_working
+                # and invalidate(): clearing now would let a concurrent
+                # recall refill the cache from pre-commit state. No
+                # after-commit hook infrastructure exists on this branch
+                # (it ships with #963/#964), so mirror the established
+                # immediate-invalidation behavior rather than inventing a
+                # one-off outbox here — unifying both under the #964
+                # mechanism is follow-up work for that PR.
                 self._invalidate_query_cache()
         return forgotten
 

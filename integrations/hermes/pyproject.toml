@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemosyne-hermes"
-version = "0.7.0"
+version = "0.7.1"
 description = "Mnemosyne memory provider for Hermes Agent — local-first, zero-cloud memory"
 readme = "README.md"
 license = "MIT"
@@ -43,10 +43,10 @@ mnemosyne = "mnemosyne_hermes"
 mnemosyne-hermes = "mnemosyne_hermes.install:main"
 
 [project.urls]
-Homepage = "https://github.com/AxDSan/mnemosyne"
-Documentation = "https://github.com/AxDSan/mnemosyne#readme"
-Repository = "https://github.com/AxDSan/mnemosyne"
-"Bug Tracker" = "https://github.com/AxDSan/mnemosyne/issues"
+Homepage = "https://github.com/mnemosyne-oss/mnemosyne"
+Documentation = "https://github.com/mnemosyne-oss/mnemosyne#readme"
+Repository = "https://github.com/mnemosyne-oss/mnemosyne"
+"Bug Tracker" = "https://github.com/mnemosyne-oss/mnemosyne/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

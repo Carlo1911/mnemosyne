@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core._connection_gc import collect_connection_cycles
-from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
+from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits
 from mnemosyne.core.journal import journal_mode
 _thread_local = threading.local()
 
@@ -207,7 +207,7 @@ def _default_db_path() -> Path:
 
 def _get_connection(db_path = None) -> sqlite3.Connection:
     """Get thread-local database connection"""
-    path = Path(db_path) if db_path else _default_db_path()
+    path = (Path(db_path) if db_path else _default_db_path()).expanduser().resolve()
     needs_reconnect = (
         not hasattr(_thread_local, "conn")
         or _thread_local.conn is None
@@ -294,7 +294,12 @@ def _close_dry_run_clone(
 
 
 def init_db(db_path: Path = None):
-    """Initialize legacy database schema + BEAM schema"""
+    """Initialize legacy and BEAM schemas under the same path lock."""
+    with beam_module._schema_init_lock(db_path if db_path is not None else _default_db_path()) as path:
+        _init_db_locked(path)
+
+
+def _init_db_locked(db_path):
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -329,8 +334,8 @@ def init_db(db_path: Path = None):
 
     conn.commit()
 
-    # Initialize BEAM schema on same DB
-    init_beam(db_path)
+    # Already inside the shared schema lock.
+    beam_module._init_beam_locked(db_path)
 
 
 # Initialize on module load
@@ -373,8 +378,8 @@ class Mnemosyne:
         else:
             self.db_path = _default_db_path()
 
-        self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
+        self.conn = _get_connection(self.db_path)
 
         # Phase 8: Streaming + Patterns + Plugins (lazy init)
         self._stream = None

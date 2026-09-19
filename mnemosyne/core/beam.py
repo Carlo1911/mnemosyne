@@ -1021,7 +1021,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     `_deferred_commits`. Connection is otherwise identical to a
     plain sqlite3.Connection.
     """
-    path = Path(db_path) if db_path else _default_db_path()
+    path = (Path(db_path) if db_path else _default_db_path()).expanduser().resolve()
     needs_reconnect = (
         not hasattr(_thread_local, 'conn')
         or _thread_local.conn is None
@@ -1211,8 +1211,48 @@ class BeamInitResult:
     stored_dims: Tuple[Tuple[str, int], ...] = ()
 
 
+_schema_locks = {}
+_schema_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _schema_init_lock(path):
+    """Serialize schema initialization across threads and local processes."""
+    path = Path(path).expanduser().resolve()
+    with _schema_locks_guard:
+        lock = _schema_locks.setdefault(str(path), threading.RLock())
+    with lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the sidecar inode: unlinking it would split concurrent lockers.
+        with open(str(path) + '.init.lock', 'a+b') as handle:
+            if os.name == 'nt':
+                import msvcrt
+                handle.seek(0, 2)
+                if handle.tell() == 0:
+                    handle.write(b'\0')
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield path
+            finally:
+                if os.name == 'nt':
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def init_beam(db_path: Path = None) -> BeamInitResult:
-    """Initialize BEAM schema and return its vector-index status."""
+    """Initialize BEAM under one canonical-path thread/process boundary."""
+    with _schema_init_lock(db_path if db_path is not None else _default_db_path()) as path:
+        return _init_beam_locked(path)
+
+
+def _init_beam_locked(db_path: Path) -> BeamInitResult:
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -1255,41 +1295,20 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_source ON episodic_memory(source)")
 
     # --- Tiered degradation migration (v2.3) ---
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN tier INTEGER DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN degraded_at TEXT")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "episodic_memory", "tier", "INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "episodic_memory", "degraded_at", "TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_tier ON episodic_memory(tier)")
 
     # --- Veracity migration (v2.4) ---
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN veracity TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN veracity TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "working_memory", "veracity", "TEXT DEFAULT 'unknown'")
+    _add_column_if_missing(conn, "episodic_memory", "veracity", "TEXT DEFAULT 'unknown'")
 
     # --- Typed memory migration (Phase 1) ---
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN memory_type TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN memory_type TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "working_memory", "memory_type", "TEXT DEFAULT 'unknown'")
+    _add_column_if_missing(conn, "episodic_memory", "memory_type", "TEXT DEFAULT 'unknown'")
 
     # --- Binary vector migration (Phase 2) ---
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN binary_vector BLOB")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "episodic_memory", "binary_vector", "BLOB")
 
     # --- E3 additive sleep migration ---
     # Working memories that sleep() has consolidated into an episodic
@@ -1302,16 +1321,9 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
     # (introduced in 2.5 by the heal-quality pipeline) records when a
     # summary row was finalized; this column records when a SOURCE row
     # was marked done by sleep. Same concept, different angle.
-    _e3_column_added = False
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN consolidated_at TEXT")
-        _e3_column_added = True
-    except sqlite3.OperationalError as exc:
-        # Only swallow "duplicate column" -- every other OperationalError
-        # (database locked, disk I/O, readonly, missing table) must
-        # surface so callers don't proceed with a broken schema.
-        if "duplicate column" not in str(exc).lower():
-            raise
+    _e3_column_added = _add_column_if_missing(
+        conn, "working_memory", "consolidated_at", "TEXT"
+    )
 
     if _e3_column_added:
         # Pre-E3 backfill: existing rows are treated as already-consolidated.
@@ -1328,11 +1340,9 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
             (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),),
         )
 
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN consolidation_claimed_at TEXT")
-    except sqlite3.OperationalError as exc:
-        if "duplicate column" not in str(exc).lower():
-            raise
+    _add_column_if_missing(
+        conn, "working_memory", "consolidation_claimed_at", "TEXT"
+    )
 
     # Partial index for the sleep eligibility predicate. Sleep scans
     # WHERE session_id = ? AND timestamp < ? AND consolidated_at IS NULL
@@ -1379,14 +1389,8 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)")
-    try:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
-    except sqlite3.OperationalError:
-        pass  # Column may not exist in older schema
-    try:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
-    except sqlite3.OperationalError:
-        pass  # Column may not exist in older schema
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
 
     # Memory events ALTER TABLE migrations (safe add columns for existing DBs)
     for col, ddl in {
@@ -1395,10 +1399,7 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
         "parent_event_ids": "parent_event_ids TEXT DEFAULT '[]'",
         "expiry": "expiry TEXT",
     }.items():
-        try:
-            cursor.execute(f"ALTER TABLE memory_events ADD COLUMN {ddl}")
-        except sqlite3.OperationalError:
-            pass
+        _add_column_if_missing(conn, "memory_events", col, ddl.split(" ", 1)[1])
 
     # Detect supported vector type
     effective_vec_type = _detect_vec_type(conn)
@@ -1445,18 +1446,12 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
                     # Pre-existing (upgraded) stores stay unmarked and
                     # route conservatively until reindex_vectors().
                     _mark_vec_store_norm_bit(conn)
-            except sqlite3.OperationalError as e:
-                if getattr(conn, "_mnemosyne_vec_loaded", False):
-                    logger.warning(
-                        "sqlite-vec loaded but vec table creation failed: %s. "
-                        "This may indicate a version mismatch.", e,
-                    )
-                else:
-                    logger.warning(
-                        "sqlite-vec tables not created: extension not loaded. "
-                        "Vector search will be unavailable. Install sqlite-vec "
-                        "and ensure your Python build supports load_extension()."
-                    )
+            except sqlite3.OperationalError as exc:
+                # Only the explicit missing-module capability error may degrade;
+                # disk I/O, readonly, lock, and other DDL failures propagate.
+                if "no such module: vec0" not in str(exc).lower():
+                    raise
+                logger.warning("sqlite-vec tables unavailable: vec0 module is not loaded")
 
     # --- FTS5 VIRTUAL TABLE for episodic ---
     cursor.execute("""
@@ -1855,8 +1850,11 @@ def init_beam(db_path: Path = None) -> BeamInitResult:
                     embedding {effective_vec_type}[{EMBEDDING_DIM}]
                 )
             """)
-        except (sqlite3.OperationalError, RuntimeError):
-            pass  # sqlite-vec not available
+        except (sqlite3.OperationalError, RuntimeError) as exc:
+            # Only an explicitly unavailable vec0 module may degrade here.
+            if "no such module: vec0" not in str(exc).lower():
+                raise
+            logger.warning("sqlite-vec facts table unavailable: vec0 module is not loaded")
 
     # --- Temporal architecture migration ---
     _add_column_if_missing(conn, "working_memory", "event_date", "TEXT DEFAULT NULL")
@@ -2223,13 +2221,73 @@ def _sanitize_utf8(text: str) -> str:
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str):
-    """Safely add a column if it doesn't already exist (SQLite migration helper)."""
+    """Add a column, then verify type/default when it already exists.
+
+    Tolerates a concurrent winner: if ALTER raises 'duplicate column name'
+    for the exact requested column because another initializer created it
+    between our read and write, reread the schema and verify it matches the
+    expected declaration exactly before suppressing.
+    """
     cursor = conn.cursor()
+
+    def _expected_pieces():
+        expected_type, _, expected_default = col_type.partition(" DEFAULT ")
+        expected_notnull = " NOT NULL" in expected_type.upper()
+        expected_type = expected_type.replace(" NOT NULL", "").strip()
+        return expected_type, expected_notnull, expected_default.strip()
+
+    def _column_matches(rows, strict_default=False):
+        matches = [r for r in rows if len(r) >= 5 and r[1] == column]
+        if len(matches) != 1:
+            return False
+        row = matches[0]
+        expected_type, expected_notnull, expected_default = _expected_pieces()
+        actual_type = row[2].strip().upper()
+        expected_type = expected_type.strip().upper()
+        # SQLite stores legacy timestamp columns as TEXT in some databases.
+        if actual_type != expected_type and {actual_type, expected_type} != {"TEXT", "TIMESTAMP"}:
+            return False
+        if bool(row[3]) != expected_notnull:
+            return False
+        actual_default = row[4].strip() if row[4] is not None else None
+        if expected_default:
+            # Existing columns may retain a historical default. A concurrent
+            # winner must match the requested declaration exactly.
+            return not strict_default or actual_default == expected_default
+        return actual_default is None
+
     cursor.execute(f"PRAGMA table_info({table})")
-    existing = {row[1] for row in cursor.fetchall()}
-    if column not in existing:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        conn.commit()
+    rows = cursor.fetchall()
+    cols = {r[1] for r in rows}
+    if column not in cols:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            conn.commit()
+            return True
+        except sqlite3.OperationalError as e:
+            msg = str(e)
+            # Suppress ONLY the duplicate-column result for this exact column,
+            # and only after post-error re-verification confirms the column now
+            # exists with the expected schema.
+            if (
+                column not in msg
+                or "duplicate column" not in msg.lower()
+            ):
+                raise
+            cursor.execute(f"PRAGMA table_info({table})")
+            if not _column_matches(cursor.fetchall(), strict_default=True):
+                raise
+            return False
+    cursor.execute(f"PRAGMA table_info({table})")
+    rows = cursor.fetchall()
+    if not _column_matches(rows):
+        actual = next((r for r in rows if len(r) >= 2 and r[1] == column), None)
+        raise sqlite3.OperationalError(
+            f"schema mismatch for {table}.{column}: expected {col_type}, "
+            f"got {actual[2] if actual and len(actual) >= 3 else '?'} "
+            f"DEFAULT {actual[4] if actual and len(actual) >= 5 else '?'}"
+        )
+    return False
 
 
 @dataclass(frozen=True)
@@ -5095,8 +5153,9 @@ class BeamMemory:
         self._extraction_client = None  # Lazy-loaded ExtractionClient
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
-        self.conn = _get_connection(self.db_path)
+        self.db_path = self.db_path.expanduser().resolve()
         self.init_result = init_beam(self.db_path)
+        self.conn = _get_connection(self.db_path)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators

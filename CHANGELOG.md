@@ -9,6 +9,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **A Hermes plugin-catalog directory, `integrations/hermes-catalog/`.** The catalog installs a directory, not a pip package, and a `plugin.yaml` with nothing loadable beside it installs and does nothing (hermes-agent#113851). The new directory is a thin wrapper: `plugin.yaml` (`name: mnemosyne`, `kind: exclusive`, the tool list), a `pyproject.toml` whose dependencies (`mnemosyne-hermes`, `mnemosyne-memory[embeddings]`) Hermes installs into its venv and re-applies after every update, and an `__init__.py` that re-exports the package's registration hooks. The PyPI project in `integrations/hermes/` is untouched, per #859. Validated with `hermes plugins validate` at hermes-agent a08dee94.
 - **The MCP tool surface now declares its per-call `bank` parameter.** `_resolve_bank()` has always read `arguments["bank"]` before falling back to `MNEMOSYNE_MCP_BANK`, so 24 of 29 handlers already routed each call to its own `Mnemosyne(bank=...)` instance rather than the process-global default. Only three schemas said so, which left the capability undiscoverable: a conforming MCP client cannot use a parameter that is not advertised, and a client validating arguments against the published schema may strip it. Every MCP-served tool that routes on it, 25 of the 29 the dispatcher handles, now declares `bank`, so a single MCP server can serve more than one tenant through its documented interface. Nothing about the runtime changed and calls that omit `bank` behave exactly as before.
 
   The four `mnemosyne_shared_*` tools are deliberately excluded: they operate on the shared surface database, which is one global store, and advertising a tenant bank there would promise an isolation that does not exist. `mnemosyne_validate` keeps its own `bank` parameter, which selects `private` or `surface` rather than a tenant partition; that collision predates this change and is left alone rather than repurposed under a shipped name. The persona, sync and `mnemosyne_triple_end` schemas are Hermes-provider-only and are not served over MCP, so they do not declare a bank either.
@@ -54,6 +55,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Standalone Hermes setup and status now survive every discovery path (#983).** The `mnemosyne-hermes` package, catalog directory wrapper, and generated persistent wrapper expose the provider CLI contract without declaring a desktop config schema that would write a second config store. `hermes memory status` uses a bounded, terminal-safe, read-only, fail-soft, secret-free view of `memory.mnemosyne`; setup keeps the provider name, existing config keys, data paths, tools, and CLI unchanged.
+- **The standalone `mnemosyne-hermes` package builds again.** A direct push on 2026-09-17 replaced `integrations/hermes/pyproject.toml` with a Hermes catalog wrapper named `mnemosyne-plugin`, so `python -m build` produced a wheel under the wrong name and CI's editable install failed. Reverted; the catalog plugin gets its own directory instead of reusing the PyPI project root.
 - **Polyphonic dense recall now honors episodic eligibility before its bounded vector result set.** Unmarked float32, int8 and binary stores are scanned over only the eligible episodic join with representation-safe cosine scoring, so another session, channel or filter cannot crowd out a valid vec-only row. Author and channel searches preserve the same cross-session scope rules through final Polyphonic filtering as linear recall. Marked stores retain sqlite-vec KNN and refill only while the finite KNN boundary may still hide an admissible row, falling back to an exact eligible scan when the 4096-candidate boundary cannot exclude one; ordinary low-similarity candidates no longer turn a bounded KNN lookup into a full-store scan. Pure and legacy Polyphonic scoring use the same stored-blob cosine and admission threshold as linear recall. If a blob-bearing KNN projection fails but its distance-only retry succeeds, unscoreable rows now fall through to the existing JSON fallback and set its diagnostic instead of suppressing a valid fallback result. A reindex performed without a usable sqlite-vec backend leaves both the untouched vec table and its existing format marker unchanged instead of falsely certifying legacy blobs as normalized. If the linear recall path cannot read the format marker, it now routes conservatively through the same exact-cosine scan instead of treating the unresolved store as KNN-safe. Existing JSON fallback rows remain available through the pre-existing fallback path when sqlite-vec is absent or unusable; this change does not add JSON-only candidate fusion or rewrite existing records.
 - **Episodic consolidation now preserves its produced embedding when a sqlite-vec write fails (#948).** The summary and matching JSON fallback commit together inside the existing transaction, so a later process without sqlite-vec can still use dense fallback lookup. If both dense writes fail without aborting the transaction, the summary commits FTS-only and a redacted warning reports that outcome. Transaction-aborting SQLite failures instead roll back the summary and propagate, so no ID is returned. Embedding-provider failures retain the existing FTS-only best-effort behavior; successful sqlite-vec writes remain ANN-backed. No historical rows are rewritten.
 - **Episodic degradation now refuses to split dense embedding stores when a persisted sqlite-vec table is unusable (#946).** If `vec_episodes` exists but the active connection cannot use it, the row's existing degradation savepoint rolls back the content, tier, timestamp, JSON/binary vectors, and ANN row together. Databases with no `vec_episodes` table retain the existing JSON/binary fallback behavior; no historical rows are rewritten.
@@ -490,7 +493,7 @@ layered memory roadmap
 ### Security
 
 - **Fix critical JWT signature verification bypass in sync server
-  ([GHSA-xcw4-53cc-hv32](https://github.com/AxDSan/mnemosyne/security/advisories/GHSA-xcw4-53cc-hv32),
+  ([GHSA-xcw4-53cc-hv32](https://github.com/mnemosyne-oss/mnemosyne/security/advisories/GHSA-xcw4-53cc-hv32),
   CVSS 9.1).** The sync server's authentication check decoded JWT bearer
   tokens but never verified their HMAC-SHA256 signatures, allowing any
   well-formed token (including `alg: none`) to be accepted. An
@@ -917,7 +920,7 @@ endpoint.
 ### Fixed
 
 - **Irrelevant context injection in recall.** Three root-cause fixes for
-  [#198](https://github.com/AxDSan/mnemosyne/issues/198):
+  [#198](https://github.com/mnemosyne-oss/mnemosyne/issues/198):
   - Strict fact matching is now the default. Set `MNEMOSYNE_LENIENT_FACT_MATCH=1`
     to opt back into permissive matching (which matched any query word against any
     stored fact, dragging in unrelated memories with a false +20% score boost).
@@ -940,7 +943,7 @@ endpoint.
 
 ### Added
 
-- **Preferred embedding env vars.** `MNEMOSYNE_EMBEDDING_API_URL` and `MNEMOSYNE_EMBEDDING_API_KEY` are now the preferred names for custom embedding endpoints. The old `OPENROUTER_BASE_URL` and `OPENROUTER_API_KEY` names still work as fallbacks for backward compatibility. Restores the v2.8.x naming convention. ([#193](https://github.com/AxDSan/mnemosyne/issues/193))
+- **Preferred embedding env vars.** `MNEMOSYNE_EMBEDDING_API_URL` and `MNEMOSYNE_EMBEDDING_API_KEY` are now the preferred names for custom embedding endpoints. The old `OPENROUTER_BASE_URL` and `OPENROUTER_API_KEY` names still work as fallbacks for backward compatibility. Restores the v2.8.x naming convention. ([#193](https://github.com/mnemosyne-oss/mnemosyne/issues/193))
 
 ## [3.1.0] - 2026-05-26
 
@@ -1539,13 +1542,13 @@ endpoint.
 - **Hermes plugin registration** — basic tool integration
 - **AAAK compression** — early context compression for token limits
 
-[3.7.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.7.0
-[3.6.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.6.0
-[3.5.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.5.0
-[3.4.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.4.0
-[3.8.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.8.0
-[3.9.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.9.0
-[3.10.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.10.0
-[3.10.1]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.10.1
-[3.11.1]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.11.1
-[3.11.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.11.0
+[3.7.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.7.0
+[3.6.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.6.0
+[3.5.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.5.0
+[3.4.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.4.0
+[3.8.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.8.0
+[3.9.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.9.0
+[3.10.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.10.0
+[3.10.1]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.10.1
+[3.11.1]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.11.1
+[3.11.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.11.0

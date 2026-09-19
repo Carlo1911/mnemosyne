@@ -4,6 +4,46 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 
 > **This is the canonical Hermes setup guide.** The README links here for full instructions.
 
+> **Desktop configuration compatibility:** current Hermes declared provider
+> schemas persist non-secret fields to provider-specific JSON (or Honcho's host
+> store); they cannot target `memory.mnemosyne` in `config.yaml`. Mnemosyne does
+> not declare that desktop surface because doing so would create a second,
+> ignored config store. Use `hermes memory setup` or `hermes config set
+> memory.mnemosyne.<key> <value>` until Hermes ships a config-backed provider
+> schema storage contract. This is an upstream release gate, not a Mnemosyne
+> runtime limitation.
+
+## Mnemosyne-owned Hermes home contract
+
+For installer and status operations, Mnemosyne uses an explicitly supplied
+`--hermes-home` (or API path) when present; otherwise it uses a non-empty
+`HERMES_HOME`, falling back to the expanded `~/.hermes`. The resulting active
+Hermes home is the base for these Mnemosyne-owned paths:
+
+- `$HERMES_HOME/plugins/mnemosyne/` is the base plugin or wrapper directory. In
+  wrapper mode it contains `mnemosyne-wrapper.json`, whose `python` and
+  `site_packages` fields record the selected Python executable and
+  site-packages directory.
+- Where the installer manages profile-link preference, it stores that choice in
+  `$HERMES_HOME/plugins/.mnemosyne-profile-links.json`.
+- The bundled skill is installed at
+  `$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`; its
+  installer-managed SHA-256 checksum is stored beside it as `SKILL.md.sha256`.
+
+A wrapper's selected side environment is intended to live outside the
+replaceable Hermes runtime. This is a Mnemosyne deployment layout, not a claim
+that Hermes itself enforces or preserves the side environment, plugin
+directory, manifest, preference file, or skill. See
+[Persistent side-venv wrapper mode](#persistent-side-venv-wrapper-mode) for
+setup and recovery instructions.
+
+Mnemosyne CI can verify its own path construction, manifest contents, plugin
+discovery, selected-home propagation, and simulated managed-venv replacement
+using temporary fixtures. It cannot verify Hermes Desktop updates, update
+behavior in tagged Hermes releases, uninstall or provider-removal behavior,
+profile deletion, or experimental package-manager semantics; those require
+validation in the corresponding Hermes distribution and release.
+
 ## Install Profile Comparison
 
 | Profile | When to use | RAM | Key tradeoff |
@@ -24,22 +64,23 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 ### Step 1: Install
 
 **Choose an install mode first.** The default writes a symbolic link into the
-Hermes home and expects that link to survive. Persistent wrapper mode instead
-keeps Mnemosyne's Python dependencies in a side venv outside the Hermes runtime
-and installs a real plugin directory. Pick wrapper mode whenever Hermes rebuilds
-its own Python environment, or where symbolic links are privileged operations:
+Hermes home and relies on that link remaining available. Persistent wrapper mode
+instead keeps Mnemosyne's Python dependencies in a side venv outside the Hermes
+runtime and installs a real plugin directory. Pick wrapper mode when you need
+independence from replacement of Hermes' own Python environment, or where
+symbolic links are privileged operations:
 
 | Your Hermes | Mode | Why |
 |---|---|---|
 | Linux or macOS, pip or source install | default (symlink) | The Hermes venv is yours and persists. |
-| Docker image | **wrapper** | The venv is rebuilt on every image update. |
-| Desktop binary installer | **wrapper** | The bundled Python environment is wiped and rebuilt on update. |
+| Docker image | **wrapper** | An image update may replace the venv. |
+| Desktop binary installer | **wrapper** | An update may replace the bundled Python environment. |
 | Native Windows | **wrapper** | The native default is the persistent wrapper install; a symbolic link needs Developer Mode or an elevated shell, so `WinError 1314` appears only when explicitly requesting `--mode symlink`. |
 | WSL | default (symlink) | Behaves like Linux. |
 
-The three wrapper rows are the same mechanism for the same underlying reason:
-something outside your control replaces or restricts the Hermes runtime, and
-Mnemosyne has to survive it. Only the paths differ. See
+The three wrapper rows use the same mechanism to keep Mnemosyne independent
+when something outside your control replaces or restricts the Hermes runtime.
+Only the paths differ. See
 [Persistent side-venv wrapper mode](#persistent-side-venv-wrapper-mode) below.
 
 **pip (recommended):**
@@ -59,7 +100,7 @@ pip install mnemosyne-hermes
 **Or from source:**
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e "integrations/hermes[dev]"
 ```

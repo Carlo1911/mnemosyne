@@ -1,15 +1,15 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/AxDSan/mnemosyne/main/assets/mnemosyne.jpg" alt="Mnemosyne" width="40%">
+<img src="https://raw.githubusercontent.com/mnemosyne-oss/mnemosyne/main/assets/mnemosyne.jpg" alt="Mnemosyne" width="40%">
 
 # Mnemosyne for Hermes Agent
 
-*Local-first memory provider for Hermes Agent. 23 tools. Zero cloud. Zero latency.*
+*Local-first memory provider for Hermes Agent. 40 tools. Zero cloud. Zero latency.*
 
 [![PyPI](https://img.shields.io/pypi/v/mnemosyne-hermes.svg)](https://pypi.org/project/mnemosyne-hermes/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/AxDSan/mnemosyne/blob/main/LICENSE)
-[![Stars](https://img.shields.io/github/stars/AxDSan/mnemosyne.svg?style=social)](https://github.com/AxDSan/mnemosyne)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/mnemosyne-oss/mnemosyne/blob/main/LICENSE)
+[![Stars](https://img.shields.io/github/stars/mnemosyne-oss/mnemosyne.svg?style=social)](https://github.com/mnemosyne-oss/mnemosyne)
 
 </div>
 
@@ -42,7 +42,7 @@ It gives Hermes:
 - **Shared surface**: compact cross-agent metadata for multi-agent workflows.
 - **Zero cloud**: SQLite on your machine. No network calls. No API keys. No quota limits.
 
-When using Mnemosyne, disable Hermes' built-in MEMORY.md/USER.md system to avoid duplication. Do NOT use `hermes tools disable memory` — that also kills all 23 Mnemosyne-registered tools (the memory toolset gates both built-in AND provider injection at `agent_init.py:1163-1172`).
+When using Mnemosyne, disable Hermes' built-in MEMORY.md/USER.md system to avoid duplication. Do NOT use `hermes tools disable memory` — that also kills all 40 Mnemosyne-registered tools (the memory toolset gates both built-in AND provider injection at `agent_init.py:1163-1172`).
 
 Edit `~/.hermes/config.yaml`:
 
@@ -217,7 +217,7 @@ extra setup steps needed.
 ### Development install
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e .
 pipx install -e integrations/hermes   # replaces hook with editable path
@@ -259,7 +259,7 @@ memory:
 
 ## Tools
 
-23 tools. All surfaced through Hermes' tool system.
+40 tools. All surfaced through Hermes' tool system.
 
 **Core memory:** `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate`
 
@@ -295,12 +295,12 @@ Memory issues are logged but never surface as user-facing errors.
 
 ## Contributing
 
-We welcome contributions. See the [Contributing Guidelines](https://github.com/AxDSan/mnemosyne/blob/main/CONTRIBUTING.md) for code style, standards, and submitting pull requests.
+We welcome contributions. See the [Contributing Guidelines](https://github.com/mnemosyne-oss/mnemosyne/blob/main/CONTRIBUTING.md) for code style, standards, and submitting pull requests.
 
 To build from source:
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 
 pip install -e .
@@ -309,9 +309,9 @@ pip install -e integrations/hermes
 
 ## Support
 
-- [Documentation](https://github.com/AxDSan/mnemosyne#readme)
+- [Documentation](https://github.com/mnemosyne-oss/mnemosyne#readme)
 - [Discord](https://discord.gg/nousresearch)
-- [Issues](https://github.com/AxDSan/mnemosyne/issues)
+- [Issues](https://github.com/mnemosyne-oss/mnemosyne/issues)
 
 ## License
 

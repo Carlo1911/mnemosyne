@@ -25,7 +25,7 @@ setup(
     description="The Universal Memory Layer for Any AI Agent — Zero-Dependency, Sub-Millisecond, Fully Private",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/AxDSan/mnemosyne",
+    url="https://github.com/mnemosyne-oss/mnemosyne",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 5 - Production/Stable",
@@ -62,9 +62,9 @@ setup(
         "model-context-protocol",
     ],
     project_urls={
-        "Bug Reports": "https://github.com/AxDSan/mnemosyne/issues",
-        "Source": "https://github.com/AxDSan/mnemosyne",
-        "Documentation": "https://github.com/AxDSan/mnemosyne/blob/main/docs/README.md",
+        "Bug Reports": "https://github.com/mnemosyne-oss/mnemosyne/issues",
+        "Source": "https://github.com/mnemosyne-oss/mnemosyne",
+        "Documentation": "https://github.com/mnemosyne-oss/mnemosyne/blob/main/docs/README.md",
     },
     extras_require={
         "llm": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20"],

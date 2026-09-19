@@ -197,6 +197,45 @@ def test_missing_vec_table_does_not_abort_delete(temp_db):
     assert _gist_count(beam, "em-3") == 0
 
 
+def test_missing_vec_table_probe_is_best_effort(temp_db, monkeypatch):
+    """The vec-table probe is exercised even without sqlite-vec installed.
+
+    clean_noise consults vec support once per run; forcing that answer to
+    True while the table is absent drives the missing-table probe
+    (SELECT 1 ... LIMIT 0 raising OperationalError, caught inside the
+    cascade) in environments where sqlite-vec is unavailable — the one
+    path the unmocked test above cannot reach there. Side-row cleanup
+    assertions are retained unchanged.
+    """
+    import mnemosyne.core.hygiene as hygiene
+
+    db_path, beam = temp_db
+    _insert_row(beam, "episodic_memory", "em-3b")
+    _seed_side_rows(beam, "em-3b")
+    beam.conn.execute("DROP TABLE IF EXISTS vec_episodes")
+    beam.conn.commit()
+
+    real_ensure = hygiene._hygiene_ensure_vec
+    consulted = []
+
+    def _spy_ensure(conn):
+        consulted.append(True)
+        real_ensure(conn)
+        return True
+
+    monkeypatch.setattr(hygiene, "_hygiene_ensure_vec", _spy_ensure)
+
+    result = clean_noise(db_path, [_candidate("em-3b", "episodic_memory")],
+                         action="delete", confirm=True, dry_run=False)
+
+    assert consulted == [True]
+    assert result.deleted == 1
+    assert result.errors == []
+    base_ep, _, ann, emb, _, _ = _counts(beam, "em-3b")
+    assert (base_ep, ann, emb) == (0, 0, 0)
+    assert _gist_count(beam, "em-3b") == 0
+
+
 def test_required_cascade_failure_rolls_back_base_delete(temp_db):
     """A failing side-row delete rolls back the base row and records an error."""
     db_path, beam = temp_db

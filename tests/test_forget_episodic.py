@@ -300,20 +300,25 @@ def test_forget_episodic_invalidates_cache_after_caller_commit(tmp_path: Path):
     issue raised by dplush and CodeRabbit in #961 review threads 7 & 8.
     """
     from mnemosyne.core.beam import _BeamConnection
+    from mnemosyne.core.query_cache import QueryCache
 
     db = tmp_path / "forget_ep_cache.db"
     beam = BeamMemory(session_id="sess-a", db_path=db)
     rowid = _seed_episodic(beam.conn, "em-cmt", "sess-a")
     _seed_cascade(beam.conn, "em-cmt", rowid if _vec_available(beam.conn) else None)
 
-    # Warm the query cache by running an enhanced recall (the path that
-    # populates ``_query_cache``), then mark it as the witness for
-    # invalidation. We monkeypatch the underlying ``cache.invalidate``
-    # call to record WHEN it fires relative to the outer commit.
+    if QueryCache is None:
+        pytest.skip("QueryCache optional dependency not installed")
+
+    # BeamMemory.__init__ does not create ``_query_cache`` by default; the
+    # cache is materialised lazily on the first enhanced-recall call. For
+    # this test we only need to observe WHEN ``invalidate()`` fires, so
+    # we create the cache explicitly and hand it to the beam. Closing
+    # the cache in ``finally`` keeps the test directory clean.
+    cache = QueryCache(db_path=tmp_path / "query_cache.db")
+    beam._query_cache = cache  # type: ignore[attr-defined]
+
     invalidation_calls: list[str] = []
-    cache = getattr(beam, "_query_cache", None)
-    if cache is None:
-        pytest.skip("QueryCache not initialised in this environment")
     real_invalidate = cache.invalidate
 
     def _spy_invalidate():
@@ -322,42 +327,42 @@ def test_forget_episodic_invalidates_cache_after_caller_commit(tmp_path: Path):
 
     cache.invalidate = _spy_invalidate  # type: ignore[assignment]
 
-    # Caller-owned transaction. ``forget_episodic`` must register a hook
-    # that fires AFTER commit, not clear the cache inline.
-    assert isinstance(beam.conn, _BeamConnection)
-    beam.conn.execute("BEGIN")
     try:
-        result = beam.forget_episodic("em-cmt")
-        assert result is True
-        # While the outer transaction is still open: invalidation MUST
-        # not have fired yet (otherwise a concurrent recall could refill
-        # the cache from pre-commit state).
-        assert invalidation_calls == [], (
-            "cache was invalidated while caller transaction was still open: "
-            f"{invalidation_calls}"
-        )
-        # And the row must still be visible inside the caller's tx
-        # (the DELETE is staged on the open transaction).
-        in_tx_count = beam.conn.execute(
-            "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", ("em-cmt",),
-        ).fetchone()[0]
-        assert in_tx_count == 1, (
-            "episodic row disappeared before caller committed; "
-            "the cascade must not have been flushed"
-        )
-        beam.conn.commit()
+        # Caller-owned transaction. ``forget_episodic`` must register a hook
+        # that fires AFTER commit, not clear the cache inline.
+        assert isinstance(beam.conn, _BeamConnection)
+        beam.conn.execute("BEGIN")
+        try:
+            result = beam.forget_episodic("em-cmt")
+            assert result is True
+            # While the outer transaction is still open: invalidation MUST
+            # not have fired yet (otherwise a concurrent recall could refill
+            # the cache from pre-commit state). Note: the episodic row
+            # itself IS no longer visible inside this connection -- SQLite
+            # exposes savepoint-local writes to the same connection -- but
+            # that is unrelated to the cache-invalidation contract that
+            # this test guards. What matters is that the cache is *not*
+            # invalidated until the caller's commit (and *not at all* on
+            # the rollback covered by the next test).
+            assert invalidation_calls == [], (
+                "cache was invalidated while caller transaction was still open: "
+                f"{invalidation_calls}"
+            )
+            beam.conn.commit()
+        finally:
+            # Cleanup: if commit failed mid-test, discard the hooks so the
+            # connection isn't left dirty.
+            if beam.conn.in_transaction:
+                beam.conn.rollback()
     finally:
-        # Cleanup: if commit failed mid-test, discard the hooks so the
-        # connection isn't left dirty.
-        if beam.conn.in_transaction:
-            beam.conn.rollback()
+        cache.close()
 
     # After commit: the hook has fired exactly once.
     assert invalidation_calls == ["invalidated"], (
         f"expected exactly one cache invalidation after commit, got "
         f"{invalidation_calls}"
     )
-    # And the row is gone for real.
+    # And the row is gone for real (committed delete).
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", ("em-cmt",),
     ).fetchone()[0] == 0
@@ -370,16 +375,20 @@ def test_forget_episodic_rollback_discards_deferred_invalidation(tmp_path: Path)
     release, and survives only when rows are persisted.
     """
     from mnemosyne.core.beam import _BeamConnection
+    from mnemosyne.core.query_cache import QueryCache
 
     db = tmp_path / "forget_ep_rb.db"
     beam = BeamMemory(session_id="sess-a", db_path=db)
     rowid = _seed_episodic(beam.conn, "em-rb2", "sess-a")
     _seed_cascade(beam.conn, "em-rb2", rowid if _vec_available(beam.conn) else None)
 
+    if QueryCache is None:
+        pytest.skip("QueryCache optional dependency not installed")
+
+    cache = QueryCache(db_path=tmp_path / "query_cache.db")
+    beam._query_cache = cache  # type: ignore[attr-defined]
+
     invalidation_calls: list[str] = []
-    cache = getattr(beam, "_query_cache", None)
-    if cache is None:
-        pytest.skip("QueryCache not initialised in this environment")
     real_invalidate = cache.invalidate
 
     def _spy_invalidate():
@@ -388,14 +397,17 @@ def test_forget_episodic_rollback_discards_deferred_invalidation(tmp_path: Path)
 
     cache.invalidate = _spy_invalidate  # type: ignore[assignment]
 
-    assert isinstance(beam.conn, _BeamConnection)
-    beam.conn.execute("BEGIN")
     try:
-        assert beam.forget_episodic("em-rb2") is True
-        # Hook is registered but not fired.
-        assert invalidation_calls == []
+        assert isinstance(beam.conn, _BeamConnection)
+        beam.conn.execute("BEGIN")
+        try:
+            assert beam.forget_episodic("em-rb2") is True
+            # Hook is registered but not fired.
+            assert invalidation_calls == []
+        finally:
+            beam.conn.rollback()
     finally:
-        beam.conn.rollback()
+        cache.close()
 
     # After rollback: hook was discarded, row is back, cache untouched.
     assert invalidation_calls == [], (

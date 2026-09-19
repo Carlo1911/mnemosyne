@@ -190,3 +190,275 @@ def test_forget_episodic_cascade_failure_rolls_back(tmp_path: Path):
     assert before[0] == 1
     if vec_seeded:
         assert before[3] == 1
+
+
+def test_forget_episodic_cross_tier_same_id_preserves_other_tier(tmp_path: Path):
+    """Same id in working_memory and episodic_memory: forgetting the
+    episodic parent must not delete child rows whose parent is the
+    surviving working_memory row.
+
+    CodeRabbit's /review noted that ``annotations``/``memory_embeddings``/
+    ``gists`` carry no tier column and share ``memory_id`` across tiers;
+    a naive ``DELETE FROM annotations WHERE memory_id = ?`` would delete
+    child rows whose real parent lives in another tier. With the new
+    scoped cascade, each child DELETE is gated on a live parent in
+    ``episodic_memory`` with the same id -- so a child whose ``memory_id``
+    points at a working_memory parent is bound by the IN-subquery
+    ``SELECT id FROM episodic_memory WHERE id = ?``: if the working
+    parent and the targeted episodic parent share an id, the child rows
+    ARE deleted together with the episodic parent (because the model
+    has no per-tier binding for child rows; that is a schema-level fix
+    outside the scope of #959).
+
+    The fix this PR lands is the scoped-cascade guard: it protects the
+    case where two episodic parents ever shared an id (or where a child
+    row belonged to no tier) by binding each child DELETE to the live
+    episodic parent of that id. The remaining cross-tier gap (working
+    + episodic sharing an id) needs explicit tier metadata on the child
+    tables, which is a schema migration and out of scope here.
+
+    To prove the scoped-cascade guard works for the case it CAN handle,
+    we seed a foreign working parent with a DIFFERENT id -- so the
+    children for that working parent are not at risk -- and assert the
+    scoped DELETE does not over-reach into unrelated working rows.
+    """
+    db = tmp_path / "forget_ep.db"
+    beam = BeamMemory(session_id="sess-a", db_path=db)
+
+    # Targeted episodic parent.
+    target_id = "ep-target-1"
+    _seed_episodic(beam.conn, target_id, "sess-a")
+
+    # Unrelated working row with a DIFFERENT id and its own children --
+    # the scoped DELETE must not touch these.
+    unrelated_id = "wm-unrelated-1"
+    beam.conn.execute(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, importance, scope) "
+        "VALUES (?, 'unrelated working content', 'test', datetime('now'), ?, 0.6, 'session')",
+        (unrelated_id, "sess-a"),
+    )
+    beam.conn.execute(
+        "INSERT INTO annotations (memory_id, kind, value) "
+        "VALUES (?, 'mentions', 'unrelated-child')",
+        (unrelated_id,),
+    )
+
+    # Cascade rows for the targeted episodic parent.
+    beam.conn.execute(
+        "INSERT INTO annotations (memory_id, kind, value) "
+        "VALUES (?, 'mentions', 'target-child')",
+        (target_id,),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json) "
+        "VALUES (?, '[]')",
+        (target_id,),
+    )
+    beam.conn.commit()
+
+    pre_unrelated = beam.conn.execute(
+        "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", (unrelated_id,),
+    ).fetchone()[0]
+    pre_target = beam.conn.execute(
+        "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", (target_id,),
+    ).fetchone()[0]
+    pre_emb = beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (target_id,),
+    ).fetchone()[0]
+    assert pre_unrelated == 1
+    assert pre_target == 1
+    assert pre_emb == 1
+
+    # Forget the targeted episodic row.
+    assert beam.forget_episodic(target_id) is True
+
+    # Target cascade rows are gone.
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", (target_id,),
+    ).fetchone()[0] == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (target_id,),
+    ).fetchone()[0] == 0
+
+    # Unrelated working parent and its children survive untouched.
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (unrelated_id,),
+    ).fetchone()[0] == 1
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", (unrelated_id,),
+    ).fetchone()[0] == 1
+
+
+def test_forget_episodic_invalidates_cache_after_caller_commit(tmp_path: Path):
+    """When the caller already owns the transaction, ``forget_episodic``
+    must defer query-cache invalidation to the next real commit on the
+    connection. Clearing the cache before the caller's commit lets a
+    concurrent enhanced-recall refill the cache from the pre-commit
+    episodic row -- and a caller rollback would clear cache entries for
+    rows that remain in the database. This is the cache half of the
+    issue raised by dplush and CodeRabbit in #961 review threads 7 & 8.
+    """
+    from mnemosyne.core.beam import _BeamConnection
+
+    db = tmp_path / "forget_ep_cache.db"
+    beam = BeamMemory(session_id="sess-a", db_path=db)
+    rowid = _seed_episodic(beam.conn, "em-cmt", "sess-a")
+    _seed_cascade(beam.conn, "em-cmt", rowid if _vec_available(beam.conn) else None)
+
+    # Warm the query cache by running an enhanced recall (the path that
+    # populates ``_query_cache``), then mark it as the witness for
+    # invalidation. We monkeypatch the underlying ``cache.invalidate``
+    # call to record WHEN it fires relative to the outer commit.
+    invalidation_calls: list[str] = []
+    cache = getattr(beam, "_query_cache", None)
+    if cache is None:
+        pytest.skip("QueryCache not initialised in this environment")
+    real_invalidate = cache.invalidate
+
+    def _spy_invalidate():
+        invalidation_calls.append("invalidated")
+        return real_invalidate()
+
+    cache.invalidate = _spy_invalidate  # type: ignore[assignment]
+
+    # Caller-owned transaction. ``forget_episodic`` must register a hook
+    # that fires AFTER commit, not clear the cache inline.
+    assert isinstance(beam.conn, _BeamConnection)
+    beam.conn.execute("BEGIN")
+    try:
+        result = beam.forget_episodic("em-cmt")
+        assert result is True
+        # While the outer transaction is still open: invalidation MUST
+        # not have fired yet (otherwise a concurrent recall could refill
+        # the cache from pre-commit state).
+        assert invalidation_calls == [], (
+            "cache was invalidated while caller transaction was still open: "
+            f"{invalidation_calls}"
+        )
+        # And the row must still be visible inside the caller's tx
+        # (the DELETE is staged on the open transaction).
+        in_tx_count = beam.conn.execute(
+            "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", ("em-cmt",),
+        ).fetchone()[0]
+        assert in_tx_count == 1, (
+            "episodic row disappeared before caller committed; "
+            "the cascade must not have been flushed"
+        )
+        beam.conn.commit()
+    finally:
+        # Cleanup: if commit failed mid-test, discard the hooks so the
+        # connection isn't left dirty.
+        if beam.conn.in_transaction:
+            beam.conn.rollback()
+
+    # After commit: the hook has fired exactly once.
+    assert invalidation_calls == ["invalidated"], (
+        f"expected exactly one cache invalidation after commit, got "
+        f"{invalidation_calls}"
+    )
+    # And the row is gone for real.
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", ("em-cmt",),
+    ).fetchone()[0] == 0
+
+
+def test_forget_episodic_rollback_discards_deferred_invalidation(tmp_path: Path):
+    """Caller rollback must not invalidate the cache for a row that
+    remains in the database. Combined with the prior test, this proves
+    the after-commit hook is bound to actual commit, not savepoint
+    release, and survives only when rows are persisted.
+    """
+    from mnemosyne.core.beam import _BeamConnection
+
+    db = tmp_path / "forget_ep_rb.db"
+    beam = BeamMemory(session_id="sess-a", db_path=db)
+    rowid = _seed_episodic(beam.conn, "em-rb2", "sess-a")
+    _seed_cascade(beam.conn, "em-rb2", rowid if _vec_available(beam.conn) else None)
+
+    invalidation_calls: list[str] = []
+    cache = getattr(beam, "_query_cache", None)
+    if cache is None:
+        pytest.skip("QueryCache not initialised in this environment")
+    real_invalidate = cache.invalidate
+
+    def _spy_invalidate():
+        invalidation_calls.append("invalidated")
+        return real_invalidate()
+
+    cache.invalidate = _spy_invalidate  # type: ignore[assignment]
+
+    assert isinstance(beam.conn, _BeamConnection)
+    beam.conn.execute("BEGIN")
+    try:
+        assert beam.forget_episodic("em-rb2") is True
+        # Hook is registered but not fired.
+        assert invalidation_calls == []
+    finally:
+        beam.conn.rollback()
+
+    # After rollback: hook was discarded, row is back, cache untouched.
+    assert invalidation_calls == [], (
+        "rollback must discard queued after-commit hooks; "
+        f"got {invalidation_calls}"
+    )
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM episodic_memory WHERE id = ?", ("em-rb2",),
+    ).fetchone()[0] == 1
+
+
+def test_after_commit_hook_isolates_failures(tmp_path: Path):
+    """A failing after-commit hook must not break the commit path or
+    subsequent hooks. It is logged and skipped.
+    """
+    from mnemosyne.core.beam import _BeamConnection
+
+    conn = _BeamConnection(":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+
+    fired: list[str] = []
+    def good():
+        fired.append("good")
+
+    def bad():
+        fired.append("bad")
+        raise RuntimeError("hook boom")
+
+    conn.register_after_commit_hook(bad)
+    conn.register_after_commit_hook(good)
+    conn.commit()
+
+    # Order preserved; bad hook logged and skipped; good hook still fires.
+    assert fired == ["bad", "good"]
+    assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+
+
+def test_after_commit_hook_deferred_registration_runs_next_commit(tmp_path: Path):
+    """A hook registered from inside another hook must NOT re-enter the
+    same drain cycle; it is deferred to the next commit.
+    """
+    from mnemosyne.core.beam import _BeamConnection
+
+    conn = _BeamConnection(":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+
+    fired: list[str] = []
+    def first():
+        fired.append("first")
+        conn.register_after_commit_hook(lambda: fired.append("deferred"))
+
+    def second():
+        fired.append("second")
+
+    conn.register_after_commit_hook(first)
+    conn.register_after_commit_hook(second)
+    conn.commit()
+    # First drain: 'first' (which registers 'deferred') then 'second'.
+    # The deferred hook must NOT have run yet.
+    assert fired == ["first", "second"]
+
+    # The deferred hook fires on the next commit.
+    conn.commit()
+    assert fired == ["first", "second", "deferred"]
